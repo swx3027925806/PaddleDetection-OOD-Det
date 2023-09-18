@@ -1,0 +1,6 @@
+pycocotools
+lap
+motmetrics
+pyclipper
+imgaug
+numba==0.56.4

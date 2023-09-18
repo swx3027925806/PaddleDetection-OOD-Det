@@ -1,0 +1,179 @@
+_BASE_: [
+  'runtime.yml',
+  'ood_detection_semi.yml',
+]
+log_iter: 20
+snapshot_epoch: 32
+weights: output/semi/model_final
+# pretrain_weights: model/PPYOLOE-Plus-120e/model_final.pdparams
+use_fused_allreduce_gradients: &use_checkpoint False
+
+epochs: &epochs 128
+cosine_epochs: &cosine_epochs 130
+
+
+### pretrain and warmup config, choose one and comment another
+semi_start_iters: 0
+ema_start_iters: 0
+use_warmup: &use_warmup False
+
+### global config
+use_simple_ema: True
+ema_decay: 0.9996
+ssod_method: DenseTeacher
+DenseTeacher:
+  train_cfg:
+    sup_weight: 1.0
+    unsup_weight: 1.0
+    loss_weight: {distill_loss_cls: 1.0, distill_loss_iou: 2.5, distill_loss_dfl: 0., distill_loss_contrast: 0.1}
+    contrast_loss:
+      temperature: 0.2
+      alpha: 0.9
+      smooth_iter: 100
+    concat_sup_data: True
+    suppress: linear
+    ratio: 0.01
+  test_cfg:
+    inference_on: teacher
+
+
+### reader config
+batch_size: &batch_size 6
+worker_num: 2
+SemiTrainReader:
+  sample_transforms:
+    - Decode: {}
+    - RandomDistort: {}
+    - RandomExpand: {fill_value: [123.675, 116.28, 103.53]}
+    - RandomFlip: {}
+    - RandomCrop: {} # unsup will be fake gt_boxes
+  weak_aug:
+    - NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], is_scale: true, norm_type: none}
+  strong_aug:
+    - StrongAugImage: {transforms: [
+        RandomColorJitter: {prob: 0.8, brightness: 0.4, contrast: 0.4, saturation: 0.4, hue: 0.1},
+        RandomErasingCrop: {},
+        RandomGaussianBlur: {prob: 0.5, sigma: [0.1, 2.0]},
+        RandomGrayscale: {prob: 0.2},
+      ]}
+    - Mosaic:
+        prob: 0.9
+        input_dim: [640, 640]
+        degrees: [-10, 10]
+        scale: [0.1, 2.0]
+        shear: [-2, 2]
+        translate: [-0.1, 0.1]
+        enable_mixup: True
+        mixup_prob: 1.0
+        mixup_scale: [0.5, 1.5]
+    - NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], is_scale: true, norm_type: none}
+  sup_batch_transforms:
+    - BatchRandomResize: {target_size: [512], random_size: True, random_interp: True, keep_ratio: False}
+    - Permute: {}
+    - PadGT: {}
+  unsup_batch_transforms:
+    - BatchRandomResize: {target_size: [512], random_size: True, random_interp: True, keep_ratio: False}
+    - Permute: {}
+  sup_batch_size: *batch_size
+  unsup_batch_size: *batch_size
+  shuffle: True
+  drop_last: True
+  collate_batch: True
+
+EvalReader:
+  sample_transforms:
+    - Decode: {}
+    - Resize: {target_size: [512, 512], keep_ratio: False, interp: 2}
+    - NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+    - Permute: {}
+  batch_size: 2
+
+TestReader:
+  inputs_def:
+    image_shape: [3, 512, 512]
+  sample_transforms:
+    - Decode: {}
+    - Resize: {target_size: [512, 512], keep_ratio: False, interp: 2}
+    - NormalizeImage: {mean: [0., 0., 0.], std: [1., 1., 1.], norm_type: none}
+    - Permute: {}
+  batch_size: 1
+
+
+### model config
+architecture: PPYOLOE
+norm_type: sync_bn
+ema_black_list: ['proj_conv.weight']
+custom_black_list: ['reduce_mean']
+PPYOLOE:
+  backbone: VisionTransformer
+  neck: YOLOCSPPAN
+  yolo_head: PPYOLOEHead
+  post_process: ~
+
+VisionTransformer:
+  patch_size: 16
+  embed_dim: 768
+  depth: 12
+  num_heads: 12
+  mlp_ratio: 4
+  qkv_bias: True
+  drop_rate: 0.0
+  drop_path_rate: 0.2
+  init_values: 0.1
+  final_norm: False
+  use_rel_pos_bias: False
+  use_sincos_pos_emb: True
+  epsilon: 0.000001 # 1e-6
+  out_indices: [11, ]
+  with_fpn: True
+  num_fpn_levels: 3
+  out_with_norm: False
+  use_checkpoint: *use_checkpoint
+
+YOLOCSPPAN:
+  in_channels: [768, 768, 768]
+  act: 'silu'
+
+eval_size: ~ # means None, but not str 'None'
+PPYOLOEHead:
+  fpn_strides: [8, 16, 32]
+  in_channels: [768, 768, 768]
+  static_assigner_epoch: -1
+  grid_cell_scale: 5.0
+  grid_cell_offset: 0.5
+  use_varifocal_loss: True
+  loss_weight: {class: 1.0, iou: 2.5, dfl: 0.5}
+  static_assigner:
+    name: ATSSAssigner
+    topk: 9
+  assigner:
+    name: TaskAlignedAssigner
+    topk: 13
+    alpha: 1.0
+    beta: 6.0
+  nms:
+    name: MultiClassNMS
+    nms_top_k: 200
+    keep_top_k: 50
+    score_threshold: 0.01
+    nms_threshold: 0.7
+
+
+### other config
+epoch: *epochs
+LearningRate:
+  base_lr: 0.0001
+  schedulers:
+  - !CosineDecay
+    max_epochs: *cosine_epochs
+    use_warmup: *use_warmup
+  - !LinearWarmup
+    start_factor: 0.001
+    epochs: 3
+
+OptimizerBuilder:
+  clip_grad_by_norm: 0.1
+  regularizer: false
+  optimizer:
+    type: AdamW
+    weight_decay: 0.0001
